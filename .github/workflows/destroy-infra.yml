@@ -45,7 +45,6 @@ jobs:
             -backend-config="region=${AWS_REGION}" \
             -backend-config="encrypt=true"
 
-      # Passing TF_VAR_* is optional for destroy, but harmless
       - name: Terraform destroy
         env:
           TF_VAR_project_name: ksymfony

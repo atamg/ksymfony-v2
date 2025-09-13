@@ -129,24 +129,56 @@ jobs:
         run: |
           set -euo pipefail
           REG="${{ steps.login-ecr.outputs.registry }}"
-          if aws ecr batch-get-image --repository-name "${ECR_REPO}" \
-               --image-ids imageTag=latest \
-               --query 'images[0].imageManifest' --output text > manifest.json 2>/dev/null; then
-            aws ecr put-image --repository-name "${ECR_REPO}" \
-              --image-tag "${{ env.VERSION }}" \
-              --image-manifest file://manifest.json
+
+          # Get the manifest (as JSON, not text) and its media type
+          RESP=$(aws ecr batch-get-image \
+            --repository-name "${ECR_REPO}" \
+            --image-ids imageTag=latest \
+            --accepted-media-types \
+              application/vnd.docker.distribution.manifest.v2+json \
+              application/vnd.oci.image.manifest.v1+json \
+              application/vnd.docker.distribution.manifest.list.v2+json \
+              application/vnd.oci.image.index.v1+json \
+            --output json || true)
+
+          if [ -n "$RESP" ] && [ "$(echo "$RESP" | jq '.images | length')" -gt 0 ]; then
+            echo "$RESP" | jq -r '.images[0].imageManifest' > manifest.json
+            MEDIA=$(echo "$RESP" | jq -r '.images[0].imageManifestMediaType // empty')
+
+            if [ -s manifest.json ]; then
+              if [ -n "$MEDIA" ]; then
+                aws ecr put-image \
+                  --repository-name "${ECR_REPO}" \
+                  --image-tag "${{ env.VERSION }}" \
+                  --image-manifest file://manifest.json \
+                  --image-manifest-media-type "$MEDIA"
+              else
+                aws ecr put-image \
+                  --repository-name "${ECR_REPO}" \
+                  --image-tag "${{ env.VERSION }}" \
+                  --image-manifest file://manifest.json
+              fi
+            else
+              echo "Manifest extraction returned empty content; building once."
+              docker buildx build --platform linux/amd64 --push \
+                -t "$REG/${ECR_REPO}:${{ env.VERSION }}" -t "$REG/${ECR_REPO}:latest" .
+            fi
           else
-            echo "No 'latest' image; building once."
+            echo "No 'latest' image found; building once."
             docker buildx build --platform linux/amd64 --push \
               -t "$REG/${ECR_REPO}:${{ env.VERSION }}" -t "$REG/${ECR_REPO}:latest" .
           fi
 
+
   deploy:
     if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
-    needs: build-and-push
+    needs: [build-and-push, establish-version]
     runs-on: ubuntu-latest
+    environment: prod
     env:
       VERSION: ${{ needs.establish-version.outputs.VERSION }}
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      ECR_REPO: ksymfony
     steps:
       - name: Configure AWS (OIDC)
         uses: aws-actions/configure-aws-credentials@v5
