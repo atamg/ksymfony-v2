@@ -1,0 +1,58 @@
+name: Destroy — Terraform
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type: DESTROY ksymfony'
+        required: true
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+
+jobs:
+  destroy:
+    if: ${{ github.event.inputs.confirm == 'DESTROY ksymfony' }}
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: infra/terraform
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ secrets.TF_AWS_ROLE_ARN }}
+          mask-aws-account-id: true
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.13.2
+
+      - name: Terraform init (S3 backend)
+        run: |
+          terraform init \
+            -backend-config="bucket=${TF_STATE_BUCKET}" \
+            -backend-config="key=ksymfony/terraform.tfstate" \
+            -backend-config="region=${AWS_REGION}" \
+            -backend-config="encrypt=true"
+
+      # Passing TF_VAR_* is optional for destroy, but harmless
+      - name: Terraform destroy
+        env:
+          TF_VAR_project_name: ksymfony
+          TF_VAR_aws_region: ${{ env.AWS_REGION }}
+          TF_VAR_vpc_id: ${{ secrets.TF_VAR_VPC_ID }}
+          TF_VAR_subnet_id: ${{ secrets.TF_VAR_SUBNET_ID }}
+          TF_VAR_key_pair_name: ${{ secrets.TF_VAR_KEYPAIR }}
+          TF_VAR_USER_ALLOWED_IP_LIST: ${{ secrets.TF_VAR_USER_ALLOWED_IP_LIST }}
+          TF_VAR_extra_ssh_public_keys: ${{ secrets.TF_VAR_EXTRA_SSH_PUBLIC_KEYS }}
+        run: terraform destroy -auto-approve
