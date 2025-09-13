@@ -1,0 +1,243 @@
+name: Release — Build, Push, Deploy
+
+on:
+  workflow_run:
+    workflows: ["Release — Terraform"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      version_tag:
+        description: 'Tag to deploy (e.g., v1.2.3)'
+        required: false
+
+concurrency:
+  group: release-${{ github.run_id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  ECR_REPO: ksymfony
+
+jobs:
+  establish-version:
+    runs-on: ubuntu-latest
+    outputs:
+      VERSION: ${{ steps.setver.outputs.VERSION }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: setver
+        run: |
+          set -euo pipefail
+          if [ -n "${{ github.event.inputs.version_tag || '' }}" ]; then
+            ver="${{ github.event.inputs.version_tag }}"
+          elif [ "${{ github.event.workflow_run.conclusion || '' }}" = "success" ]; then
+            sha="${{ github.event.workflow_run.head_sha }}"
+            git fetch --tags --force
+            ver=$(git tag --points-at "$sha" | grep -E '^v[0-9]' | head -n1 || true)
+          else
+            ver="${GITHUB_REF_NAME:-}"
+          fi
+          if [ -z "$ver" ]; then
+            echo "Could not determine release tag." >&2
+            exit 1
+          fi
+          echo "VERSION=$ver" >> $GITHUB_OUTPUT
+
+  detect-changes:
+    needs: establish-version
+    runs-on: ubuntu-latest
+    outputs:
+      app_changed: ${{ steps.diff.outputs.app }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: diff
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.establish-version.outputs.VERSION }}"
+          git fetch --tags --force
+          prev=$(git tag --sort=-creatordate -l 'v*' | grep -v "^$VERSION$" | head -n1 || true)
+          if [ -z "$prev" ]; then
+            echo "app=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          if git diff --name-only "$prev" "$VERSION" -- \
+               Dockerfile docker/ src/ public/ config/ composer.json composer.lock \
+               | grep . >/dev/null; then
+            echo "app=true" >> $GITHUB_OUTPUT
+          else
+            echo "app=false" >> $GITHUB_OUTPUT
+          fi
+
+  build-and-push:
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
+    needs: [establish-version, detect-changes]
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.establish-version.outputs.VERSION }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ secrets.APP_AWS_ROLE_ARN }}
+          mask-aws-account-id: true
+
+      - name: Ensure ECR repo exists
+        run: |
+          set -euo pipefail
+          if ! aws ecr describe-repositories --repository-names "${ECR_REPO}" >/dev/null 2>&1; then
+            aws ecr create-repository --repository-name "${ECR_REPO}" \
+              --image-scanning-configuration scanOnPush=true \
+              --image-tag-mutability MUTABLE
+          fi
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build & push image (changed)
+        if: needs.detect-changes.outputs.app_changed == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64
+          tags: |
+            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPO }}:${{ env.VERSION }}
+            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPO }}:latest
+          cache-from: type=gha,scope=${{ env.ECR_REPO }}
+          cache-to: type=gha,mode=max,scope=${{ env.ECR_REPO }}
+
+      - name: Retag latest → version (no rebuild)
+        if: needs.detect-changes.outputs.app_changed != 'true'
+        run: |
+          set -euo pipefail
+          REG="${{ steps.login-ecr.outputs.registry }}"
+          if aws ecr batch-get-image --repository-name "${ECR_REPO}" \
+               --image-ids imageTag=latest \
+               --query 'images[0].imageManifest' --output text > manifest.json 2>/dev/null; then
+            aws ecr put-image --repository-name "${ECR_REPO}" \
+              --image-tag "${{ env.VERSION }}" \
+              --image-manifest file://manifest.json
+          else
+            echo "No 'latest' image; building once."
+            docker buildx build --platform linux/amd64 --push \
+              -t "$REG/${ECR_REPO}:${{ env.VERSION }}" -t "$REG/${ECR_REPO}:latest" .
+          fi
+
+  deploy:
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.establish-version.outputs.VERSION }}
+    steps:
+      - name: Configure AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ secrets.APP_AWS_ROLE_ARN }}
+          mask-aws-account-id: true
+
+      - name: Discover instance (Project=ksymfony)
+        id: find
+        run: |
+          set -euo pipefail
+          HOST=$(aws ec2 describe-instances \
+            --filters "Name=tag:Project,Values=ksymfony" "Name=instance-state-name,Values=running" \
+            --query "Reservations[].Instances[].PublicDnsName" --output text)
+          if [ -z "$HOST" ] || [ "$HOST" = "None" ]; then
+            HOST=$(aws ec2 describe-instances \
+              --filters "Name=tag:Project,Values=ksymfony" "Name=instance-state-name,Values=running" \
+              --query "Reservations[].Instances[].PublicIpAddress" --output text)
+          fi
+          if [ -z "$HOST" ] || [ "$HOST" = "None" ]; then
+            echo "No running instance found"
+            exit 1
+          fi
+          echo "host=$HOST" >> $GITHUB_OUTPUT
+
+      - name: Discover SSH CI Security Group ID
+        id: sg
+        run: |
+          set -euo pipefail
+          SG_ID=$(aws ec2 describe-security-groups \
+            --filters "Name=group-name,Values=ksymfony-ssh-ci" "Name=tag:Project,Values=ksymfony" \
+            --query "SecurityGroups[0].GroupId" --output text)
+          if [ -z "$SG_ID" ] || [ "$SG_ID" = "None" ]; then
+            echo "Could not find 'ksymfony-ssh-ci' security group" >&2
+            exit 1
+          fi
+          echo "id=$SG_ID" >> $GITHUB_OUTPUT
+
+      - name: Authorize THIS runner IP for SSH (22)
+        id: open_ssh
+        run: |
+          set -euo pipefail
+          RUNNER_IP=$(curl -s https://api.ipify.org)
+          echo "runner_ip=$RUNNER_IP" >> $GITHUB_OUTPUT
+          aws ec2 authorize-security-group-ingress \
+            --group-id "${{ steps.sg.outputs.id }}" \
+            --ip-permissions "IpProtocol=tcp,FromPort=22,ToPort=22,IpRanges=[{CidrIp=${RUNNER_IP}/32,Description=GitHubActions}]"
+
+      - name: Get ECR login password
+        id: ecrpass
+        run: echo "pwd=$(aws ecr get-login-password --region $AWS_REGION)" >> $GITHUB_OUTPUT
+
+      - name: Copy deployment files to EC2
+        uses: appleboy/scp-action@v1
+        with:
+          host: ${{ steps.find.outputs.host }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          fingerprint: ${{ secrets.EC2_HOST_FINGERPRINT }}
+          source: |
+            public/**
+            docker/nginx/default.conf
+            deploy/docker-compose.ec2.yml
+          target: /opt/app
+
+      - name: Deploy (compose pull/up with version tag)
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ steps.find.outputs.host }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          fingerprint: ${{ secrets.EC2_HOST_FINGERPRINT }}
+          script: |
+            set -euo pipefail
+            REG="$(aws sts get-caller-identity --query Account --output text).dkr.ecr.${AWS_REGION}.amazonaws.com"
+            ECR_URL="$REG/${{ env.ECR_REPO }}"
+            echo "${{ steps.ecrpass.outputs.pwd }}" | docker login --username AWS --password-stdin "$REG"
+            cd /opt/app
+            export APP_IMAGE="$ECR_URL:${{ env.VERSION }}"
+            ln -sf deploy/docker-compose.ec2.yml docker-compose.yml
+            docker compose pull
+            docker compose up -d
+            docker image prune -f || true
+
+      - name: Revoke THIS runner IP for SSH (22)
+        if: always()
+        run: |
+          set -euo pipefail
+          RUNNER_IP="${{ steps.open_ssh.outputs.runner_ip }}"
+          aws ec2 revoke-security-group-ingress \
+            --group-id "${{ steps.sg.outputs.id }}" \
+            --protocol tcp --port 22 \
+            --cidr "${RUNNER_IP}/32" || true
