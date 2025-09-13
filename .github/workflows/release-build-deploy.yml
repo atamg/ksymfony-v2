@@ -232,6 +232,35 @@ jobs:
         id: ecrpass
         run: echo "pwd=$(aws ecr get-login-password --region $AWS_REGION)" >> $GITHUB_OUTPUT
 
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Preflight — verify files exist
+        run: |
+          set -euo pipefail
+          # list what we have (helps debugging)
+          echo "Top-level files:" && ls -la
+          echo "docker/nginx:" && ls -la docker/nginx || true
+          echo "deploy:" && ls -la deploy || true
+
+          # make sure all sources exist / match at least one file
+          paths=('public/**' 'docker/nginx/default.conf' 'deploy/docker-compose.ec2.yml')
+          for p in "${paths[@]}"; do
+            if ! compgen -G "$p" >/dev/null; then
+              echo "::error::No files matched '$p' in $GITHUB_WORKSPACE"
+              exit 1
+            fi
+          done
+      
+      - name: Stage files for deploy
+        run: |
+          set -euo pipefail
+          rm -rf _deploy && mkdir -p _deploy/docker/nginx _deploy/deploy
+          cp -a public _deploy/public
+          cp docker/nginx/default.conf _deploy/docker/nginx/default.conf
+          cp deploy/docker-compose.ec2.yml _deploy/deploy/docker-compose.ec2.yml
+          find _deploy -maxdepth 3 -type f -printf "%P\n"
+
       - name: Copy deployment files to EC2
         uses: appleboy/scp-action@v1
         with:
@@ -239,11 +268,9 @@ jobs:
           username: ${{ secrets.EC2_USER }}
           key: ${{ secrets.EC2_SSH_KEY }}
           fingerprint: ${{ secrets.EC2_HOST_FINGERPRINT }}
-          source: |
-            public/**
-            docker/nginx/default.conf
-            deploy/docker-compose.ec2.yml
+          source: _deploy
           target: /opt/app
+          debug: true
 
       - name: Deploy (compose pull/up with version tag)
         uses: appleboy/ssh-action@v1
@@ -252,16 +279,33 @@ jobs:
           username: ${{ secrets.EC2_USER }}
           key: ${{ secrets.EC2_SSH_KEY }}
           fingerprint: ${{ secrets.EC2_HOST_FINGERPRINT }}
+          envs: AWS_REGION,ECR_REPO,VERSION
           script: |
             set -euo pipefail
-            REG="$(aws sts get-caller-identity --query Account --output text).dkr.ecr.${AWS_REGION}.amazonaws.com"
-            ECR_URL="$REG/${{ env.ECR_REPO }}"
-            echo "${{ steps.ecrpass.outputs.pwd }}" | docker login --username AWS --password-stdin "$REG"
             cd /opt/app
-            export APP_IMAGE="$ECR_URL:${{ env.VERSION }}"
-            ln -sf deploy/docker-compose.ec2.yml docker-compose.yml
-            docker compose pull
-            docker compose up -d
+
+            if [ -d "_deploy" ]; then
+              # ensure docker/nginx exists
+              mkdir -p docker/nginx deploy
+              # copy staged files in place (install rsync if you prefer exact mirroring)
+              shopt -s dotglob
+              cp -a _deploy/public ./ || true
+              cp -a _deploy/docker/nginx/default.conf docker/nginx/default.conf || true
+              cp -a _deploy/deploy/docker-compose.ec2.yml deploy/docker-compose.ec2.yml || true
+              shopt -u dotglob
+              rm -rf _deploy
+            fi
+
+            ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text --region "$AWS_REGION")"
+            REG="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+            ECR_URL="$REG/${ECR_REPO}"
+            APP="$ECR_URL:${VERSION}"
+
+            echo "${{ steps.ecrpass.outputs.pwd }}" | docker login --username AWS --password-stdin "$REG"
+
+            APP_IMAGE="$APP" docker compose -f deploy/docker-compose.ec2.yml pull
+            APP_IMAGE="$APP" docker compose -f deploy/docker-compose.ec2.yml up -d
+            
             docker image prune -f || true
 
       - name: Revoke THIS runner IP for SSH (22)
