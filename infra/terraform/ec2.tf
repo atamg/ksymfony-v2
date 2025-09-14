@@ -34,6 +34,12 @@ resource "aws_cloudwatch_log_group" "docker" {
   retention_in_days = var.cw_logs_retention_days
 }
 
+resource "aws_iam_role_policy_attachment" "ec2_cw_agent" {
+  role       = aws_iam_role.ec2_role.name
+  policy_arn = "arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy"
+}
+
+
 resource "aws_instance" "app" {
   ami                         = data.aws_ssm_parameter.al2023_ami.value
   instance_type               = var.instance_type
