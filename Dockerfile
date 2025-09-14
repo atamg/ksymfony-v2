@@ -1,5 +1,5 @@
 # --- Build stage
-FROM php:8.2-fpm-alpine AS build
+FROM php:8.3-fpm-alpine AS build
 
 RUN set -eux; \
     apk add --no-cache --virtual .build-deps $PHPIZE_DEPS icu-dev git unzip; \
@@ -19,7 +19,7 @@ RUN COMPOSER_ALLOW_SUPERUSER=1 \
  && composer dump-autoload --classmap-authoritative --no-dev
 
 # --- Runtime stage
-FROM php:8.2-fpm-alpine
+FROM php:8.3-fpm-alpine
 RUN apk add --no-cache icu-libs netcat-openbsd \
  && docker-php-ext-install opcache
 
