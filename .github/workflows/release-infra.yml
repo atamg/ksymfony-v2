@@ -85,3 +85,10 @@ jobs:
         run: |
           echo "## Terraform Outputs" >> $GITHUB_STEP_SUMMARY
           terraform output -json | jq -r 'to_entries[] | "- \(.key): \(.value.value)"' >> $GITHUB_STEP_SUMMARY || echo "- No outputs"
+
+# Release — Terraform
+# Deploys infrastructure using Terraform on tag push or manual trigger.
+# - Configures AWS credentials via OIDC
+# - Ensures S3 bucket for state exists
+# - Initializes, validates, plans, and applies Terraform
+# - Summarizes outputs

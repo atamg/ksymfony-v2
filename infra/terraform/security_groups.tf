@@ -1,3 +1,6 @@
+# Security group resources for app, CI SSH, and static SSH allow-list.
+# Outputs security group IDs for use elsewhere.
+
 resource "aws_security_group" "app_sg" {
   name        = "${var.project_name}-sg"
   description = "Web ingress; full egress"

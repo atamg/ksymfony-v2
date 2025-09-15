@@ -1,5 +1,15 @@
 name: Release — Test, Build, Push, Deploy
 
+# Release — Test, Build, Push, Deploy
+# CI/CD pipeline triggered after infra release or manually.
+# - Establishes release version from tag or workflow
+# - Detects app changes between releases
+# - Runs PHP tests, static analysis, and security scans
+# - Builds and pushes Docker image to ECR (if changed)
+# - Retags latest image if unchanged
+# - Deploys to EC2 via SCP/SSH, updating files and running compose
+# - Manages SSH access for runner
+
 on:
   workflow_run:
     workflows: ["Release — Terraform"]

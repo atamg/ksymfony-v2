@@ -8,8 +8,11 @@ use Symfony\Bundle\FrameworkBundle\Test\WebTestCase;
 
 final class HealthCheckTest extends WebTestCase
 {
+    // Functional tests for HealthController endpoints.
+
     public function testHealthzReturns200AndJson(): void
     {
+        // Test /healthz endpoint returns 200 and expected JSON.
         $client = static::createClient();
         $client->request('GET', '/healthz');
 
@@ -22,6 +25,7 @@ final class HealthCheckTest extends WebTestCase
 
     public function testReadyzReturns200AndJson(): void
     {
+        // Test /readyz endpoint returns 200 and valid JSON.
         $client = static::createClient();
         $client->request('GET', '/readyz');
 

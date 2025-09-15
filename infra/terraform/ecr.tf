@@ -1,3 +1,6 @@
+# ECR repository and lifecycle policy for container images.
+# Outputs repository info for use elsewhere.
+
 resource "aws_ecr_repository" "app" {
   name = var.project_name
   image_scanning_configuration { scan_on_push = true }

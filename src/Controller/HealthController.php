@@ -7,23 +7,26 @@ namespace App\Controller;
 use Symfony\Component\HttpFoundation\JsonResponse;
 use Symfony\Component\Routing\Attribute\Route;
 
+// HealthController provides endpoints for liveness and readiness probes.
 final class HealthController
 {
     #[Route('/healthz', name: 'healthz', methods: ['GET'])]
     public function healthz(): JsonResponse
     {
-        // Liveness: process is up
+        // Liveness: returns OK if the process is running.
         return new JsonResponse(['status' => 'ok']); // 200 OK
     }
 
     #[Route('/readyz', name: 'readyz', methods: ['GET'])]
     public function readyz(): JsonResponse
     {
-        // Readiness: application is ready to serve traffic
+        // Readiness: checks if the app is ready to serve traffic.
+        // Add more checks here as needed (e.g., DB, cache).
         $checks = [
-            'php_fpm' => true,
+            'php_fpm' => true, // Example check: PHP-FPM is up
         ];
-        $ready = true; // !in_array(false, $checks, true);
+        $ready = true; // Set to false if any check fails
+        // !in_array(false, $checks, true);
 
         return new JsonResponse([
             'ready' => $ready,

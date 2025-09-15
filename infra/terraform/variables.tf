@@ -1,3 +1,5 @@
+# Declares input variables for project, AWS, networking, SSH, logging, and instance settings.
+
 variable "project_name" { 
   type = string
   default = "ksymfony" 

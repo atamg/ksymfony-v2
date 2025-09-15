@@ -1,3 +1,6 @@
+# EC2 instance, IAM roles, CloudWatch logging, and user data for provisioning app host.
+# Outputs instance info for use elsewhere.
+
 data "aws_iam_policy_document" "ec2_assume" {
   statement {
     effect = "Allow"

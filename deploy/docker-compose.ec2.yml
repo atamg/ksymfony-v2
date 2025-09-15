@@ -1,3 +1,6 @@
+# Docker Compose for EC2 deployment.
+# Uses ECR image for PHP and configures Nginx for production.
+
 services:
   php:
     image: ${APP_IMAGE:?Set APP_IMAGE to your ECR image}

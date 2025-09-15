@@ -1,3 +1,6 @@
+# Dockerfile for building Symfony PHP-FPM app.
+# Multi-stage build for optimized production image.
+
 # --- Build stage
 FROM php:8.3-fpm-alpine AS build
 

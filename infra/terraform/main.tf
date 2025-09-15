@@ -1,3 +1,5 @@
+# Terraform main configuration: backend, provider, and identity data sources.
+
 terraform {
   required_version = ">= 1.6.0"
   required_providers {
