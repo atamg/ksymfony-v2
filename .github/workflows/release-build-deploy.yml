@@ -64,27 +64,32 @@ jobs:
     needs: establish-version
     runs-on: ubuntu-latest
     outputs:
-      app_changed: ${{ steps.diff.outputs.app }}
+      app_changed: ${{ steps.decide.outputs.app }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - id: diff
+      - id: decide
         run: |
           set -euo pipefail
           VERSION="${{ needs.establish-version.outputs.VERSION }}"
-          git fetch --tags --force
-          prev=$(git tag --sort=-creatordate -l 'v*' | grep -v "^$VERSION$" | head -n1 || true)
-          if [ -z "$prev" ]; then
-            echo "app=true" >> "$GITHUB_OUTPUT"
+          if [ -n "${{ github.event.inputs.version_tag || '' }}" ]; then
+            echo "app=false" >> "$GITHUB_OUTPUT"  # user asked a specific tag; don't rebuild
             exit 0
-          fi
-          if git diff --name-only "$prev" "$VERSION" -- \
-               Dockerfile docker/ src/ public/ config/ composer.json composer.lock \
-               | grep . >/dev/null; then
-            echo "app=true" >> "$GITHUB_OUTPUT"
           else
-            echo "app=false" >> "$GITHUB_OUTPUT"
+            git fetch --tags --force
+            prev=$(git tag --sort=-creatordate -l 'v*' | grep -v "^$VERSION$" | head -n1 || true)
+            if [ -z "$prev" ]; then
+              echo "app=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            if git diff --name-only "$prev" "$VERSION" -- \
+                 Dockerfile docker/ src/ public/ config/ composer.json composer.lock \
+                 | grep . >/dev/null; then
+              echo "app=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "app=false" >> "$GITHUB_OUTPUT"
+            fi
           fi
 
   # ---------- CI: tests & static analysis ----------
@@ -205,6 +210,9 @@ jobs:
       VERSION: ${{ needs.establish-version.outputs.VERSION }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ env.VERSION }}
 
       - name: Configure AWS (OIDC)
         uses: aws-actions/configure-aws-credentials@v5
@@ -231,10 +239,83 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
+      
+      # Check if this exact version tag already exists in ECR
+      - name: Check if ECR has this version
+        id: has_ver
+        run: |
+          set -euo pipefail
+          if aws ecr describe-images \
+               --repository-name "${ECR_REPO}" \
+               --image-ids imageTag="${{ env.VERSION }}" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+      
+      - name: Check if ECR :latest exists
+        id: has_latest
+        run: |
+          set -euo pipefail
+          if aws ecr describe-images --repository-name "${ECR_REPO}" \
+               --image-ids imageTag=latest >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
 
+      #Create VERSION from :latest when unchanged and VERSION missing
+      - name: Create :${{ env.VERSION }} from :latest (unchanged)
+        if: needs.detect-changes.outputs.app_changed != 'true' && steps.has_ver.outputs.exists != 'true' && steps.has_latest.outputs.exists == 'true'
+        run: |
+          set -euo pipefail
+          RESP=$(aws ecr batch-get-image \
+            --repository-name "${ECR_REPO}" \
+            --image-ids imageTag=latest \
+            --accepted-media-types \
+              application/vnd.docker.distribution.manifest.v2+json \
+              application/vnd.oci.image.manifest.v1+json \
+              application/vnd.docker.distribution.manifest.list.v2+json \
+              application/vnd.oci.image.index.v1+json \
+            --output json)
+          echo "$RESP" | jq -r '.images[0].imageManifest' > manifest.json
+          MEDIA=$(echo "$RESP" | jq -r '.images[0].imageManifestMediaType // empty')
+          if [ -s manifest.json ]; then
+            if [ -n "$MEDIA" ]; then
+              aws ecr put-image \
+                --repository-name "${ECR_REPO}" \
+                --image-tag "${{ env.VERSION }}" \
+                --image-manifest file://manifest.json \
+                --image-manifest-media-type "$MEDIA"
+            else
+              aws ecr put-image \
+                --repository-name "${ECR_REPO}" \
+                --image-tag "${{ env.VERSION }}" \
+                --image-manifest file://manifest.json
+            fi
+          else
+            echo "Empty manifest from :latest"; exit 1
+          fi
+
+      # Fallback build when neither VERSION nor :latest exist (unchanged path)
+      - name: Fallback build & push (unchanged, no :latest)
+        if: needs.detect-changes.outputs.app_changed != 'true' && steps.has_ver.outputs.exists != 'true' && steps.has_latest.outputs.exists != 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64
+          tags: |
+            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPO }}:${{ env.VERSION }}
+            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPO }}:latest
+          build-args: |
+            APP_VERSION=${{ env.VERSION }}
+          cache-from: type=gha,scope=${{ env.ECR_REPO }}
+          cache-to: type=gha,mode=max,scope=${{ env.ECR_REPO }}
+        
       # ---- Build (local) & scan image BEFORE pushing (when changed) ----
       - name: Build image (load locally for scan)
-        if: needs.detect-changes.outputs.app_changed == 'true'
+        if: needs.detect-changes.outputs.app_changed == 'true' && steps.has_ver.outputs.exists != 'true'
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -242,23 +323,10 @@ jobs:
           platforms: linux/amd64
           tags: app:ci-${{ github.sha }}
           build-args: |
-            APP_VERSION=${{ needs.establish-version.outputs.VERSION }}
+            APP_VERSION=${{ env.VERSION }}
           cache-from: type=gha,scope=${{ env.ECR_REPO }}
           cache-to: type=gha,mode=max,scope=${{ env.ECR_REPO }}
-      
-      - name: Check if ECR :latest exists
-        id: has_latest
-        run: |
-          set -euo pipefail
-          if aws ecr describe-images \
-               --repository-name "${ECR_REPO}" \
-               --image-ids imageTag=latest >/dev/null 2>&1; then
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
-            echo "No :latest in ${ECR_REPO} yet; will skip pre-retag scan."
-          fi
-
+          
       - name: Trivy scan — image (local)
         if: needs.detect-changes.outputs.app_changed != 'true' && steps.has_latest.outputs.exists == 'true'
         uses: aquasecurity/trivy-action@0.33.1
@@ -291,7 +359,7 @@ jobs:
 
       # ---- Push (or retag) only after scans passed ----
       - name: Build & push image (changed)
-        if: needs.detect-changes.outputs.app_changed == 'true'
+        if: needs.detect-changes.outputs.app_changed == 'true' && steps.has_ver.outputs.exists != 'true'
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -301,55 +369,29 @@ jobs:
             ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPO }}:${{ env.VERSION }}
             ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPO }}:latest
           build-args: |
-            APP_VERSION=${{ needs.establish-version.outputs.VERSION }}
+            APP_VERSION=${{ env.VERSION }}
           cache-from: type=gha,scope=${{ env.ECR_REPO }}
           cache-to: type=gha,mode=max,scope=${{ env.ECR_REPO }}
 
       - name: Retag latest → version (no rebuild)
-        if: needs.detect-changes.outputs.app_changed != 'true'
+        if: steps.has_ver.outputs.exists == 'true'
         run: |
           set -euo pipefail
-          REG="${{ steps.login-ecr.outputs.registry }}"
-
           RESP=$(aws ecr batch-get-image \
             --repository-name "${ECR_REPO}" \
-            --image-ids imageTag=latest \
+            --image-ids imageTag="${{ env.VERSION }}" \
             --accepted-media-types \
               application/vnd.docker.distribution.manifest.v2+json \
               application/vnd.oci.image.manifest.v1+json \
               application/vnd.docker.distribution.manifest.list.v2+json \
               application/vnd.oci.image.index.v1+json \
-            --output json || true)
+            --output json)
+          echo "$RESP" | jq -r '.images[0].imageManifest' > manifest.json
+          aws ecr put-image \
+            --repository-name "${ECR_REPO}" \
+            --image-tag latest \
+            --image-manifest file://manifest.json
 
-          if [ -n "$RESP" ] && [ "$(echo "$RESP" | jq '.images | length')" -gt 0 ]; then
-            echo "$RESP" | jq -r '.images[0].imageManifest' > manifest.json
-            MEDIA=$(echo "$RESP" | jq -r '.images[0].imageManifestMediaType // empty')
-
-            if [ -s manifest.json ]; then
-              if [ -n "$MEDIA" ]; then
-                aws ecr put-image \
-                  --repository-name "${ECR_REPO}" \
-                  --image-tag "${{ env.VERSION }}" \
-                  --image-manifest file://manifest.json \
-                  --image-manifest-media-type "$MEDIA"
-              else
-                aws ecr put-image \
-                  --repository-name "${ECR_REPO}" \
-                  --image-tag "${{ env.VERSION }}" \
-                  --image-manifest file://manifest.json
-              fi
-            else
-              echo "Manifest extraction returned empty content; building once."
-              docker buildx build --platform linux/amd64 --push \
-                -t "$REG/${ECR_REPO}:${{ env.VERSION }}" -t "$REG/${ECR_REPO}:latest" .
-            fi
-          else
-            echo "No 'latest' image found; building once."
-            docker buildx build --platform linux/amd64 --push \
-              -t "$REG/${ECR_REPO}:${{ env.VERSION }}" -t "$REG/${ECR_REPO}:latest" .
-          fi
-
-      # Optional: ensure the final VERSION tag in ECR is scanned (covers the rare fallback-build path above)
       - name: Trivy scan — final image (registry)
         if: needs.detect-changes.outputs.app_changed != 'true'
         uses: aquasecurity/trivy-action@0.33.1
@@ -487,6 +529,12 @@ jobs:
             APP="$ECR_URL:${VERSION}"
 
             echo "${{ steps.ecrpass.outputs.pwd }}" | docker login --username AWS --password-stdin "$REG"
+
+            DIGEST=$(aws ecr batch-get-image \
+              --repository-name "${ECR_REPO}" \
+              --image-ids imageTag="${VERSION}" \
+              --query 'images[0].imageId.imageDigest' --output text)
+            echo "Deploying ${APP} @ ${DIGEST}"
 
             printf "APP_IMAGE=%s\nAPP_VERSION=%s\n" "$APP" "$VERSION" > .env
 
