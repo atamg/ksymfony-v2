@@ -241,6 +241,8 @@ jobs:
           load: true
           platforms: linux/amd64
           tags: app:ci-${{ github.sha }}
+          build-args: |
+            APP_VERSION=${{ needs.establish-version.outputs.VERSION }}
           cache-from: type=gha,scope=${{ env.ECR_REPO }}
           cache-to: type=gha,mode=max,scope=${{ env.ECR_REPO }}
       
@@ -298,6 +300,8 @@ jobs:
           tags: |
             ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPO }}:${{ env.VERSION }}
             ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPO }}:latest
+          build-args: |
+            APP_VERSION=${{ needs.establish-version.outputs.VERSION }}
           cache-from: type=gha,scope=${{ env.ECR_REPO }}
           cache-to: type=gha,mode=max,scope=${{ env.ECR_REPO }}
 
@@ -484,8 +488,10 @@ jobs:
 
             echo "${{ steps.ecrpass.outputs.pwd }}" | docker login --username AWS --password-stdin "$REG"
 
-            APP_IMAGE="$APP" docker compose -f deploy/docker-compose.ec2.yml pull
-            APP_IMAGE="$APP" docker compose -f deploy/docker-compose.ec2.yml up -d
+            printf "APP_IMAGE=%s\nAPP_VERSION=%s\n" "$APP" "$VERSION" > .env
+
+            docker compose --env-file .env -f deploy/docker-compose.ec2.yml pull
+            docker compose --env-file .env -f deploy/docker-compose.ec2.yml up -d
 
             docker image prune -f || true
 
