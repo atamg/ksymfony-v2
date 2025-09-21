@@ -264,7 +264,7 @@ jobs:
             echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
 
-      #Create VERSION from :latest when unchanged and VERSION missing
+      # Create VERSION from :latest when unchanged and VERSION missing
       - name: Create :${{ env.VERSION }} from :latest (unchanged)
         if: needs.detect-changes.outputs.app_changed != 'true' && steps.has_ver.outputs.exists != 'true' && steps.has_latest.outputs.exists == 'true'
         run: |
@@ -307,7 +307,6 @@ jobs:
           platforms: linux/amd64
           tags: |
             ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPO }}:${{ env.VERSION }}
-            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPO }}:latest
           build-args: |
             APP_VERSION=${{ env.VERSION }}
           cache-from: type=gha,scope=${{ env.ECR_REPO }}
@@ -357,7 +356,7 @@ jobs:
           ignore-unfixed: true
           severity: 'HIGH,CRITICAL'
 
-      # ---- Push (or retag) only after scans passed ----
+      # ---- Push only the version tag on changed builds (never push :latest) ----
       - name: Build & push image (changed)
         if: needs.detect-changes.outputs.app_changed == 'true' && steps.has_ver.outputs.exists != 'true'
         uses: docker/build-push-action@v6
@@ -367,14 +366,14 @@ jobs:
           platforms: linux/amd64
           tags: |
             ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPO }}:${{ env.VERSION }}
-            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPO }}:latest
+
           build-args: |
             APP_VERSION=${{ env.VERSION }}
           cache-from: type=gha,scope=${{ env.ECR_REPO }}
           cache-to: type=gha,mode=max,scope=${{ env.ECR_REPO }}
 
-      - name: Retag latest → version (no rebuild)
-        if: steps.has_ver.outputs.exists == 'true'
+      # Make :latest point to the selected VERSION (idempotent, no rebuild)
+      - name: Ensure :latest equals :${{ env.VERSION }} (no rebuild)
         run: |
           set -euo pipefail
           RESP=$(aws ecr batch-get-image \
@@ -386,11 +385,24 @@ jobs:
               application/vnd.docker.distribution.manifest.list.v2+json \
               application/vnd.oci.image.index.v1+json \
             --output json)
+          if [ -z "$RESP" ] || [ "$(echo "$RESP" | jq '.images | length')" -eq 0 ]; then
+            echo "::error::ECR does not have ${ECR_REPO}:${{ env.VERSION }}; cannot set :latest"
+            exit 1
+          fi
           echo "$RESP" | jq -r '.images[0].imageManifest' > manifest.json
-          aws ecr put-image \
-            --repository-name "${ECR_REPO}" \
-            --image-tag latest \
-            --image-manifest file://manifest.json
+          MEDIA=$(echo "$RESP" | jq -r '.images[0].imageManifestMediaType // empty')
+          if [ -n "$MEDIA" ]; then
+            aws ecr put-image \
+              --repository-name "${ECR_REPO}" \
+              --image-tag latest \
+              --image-manifest file://manifest.json \
+              --image-manifest-media-type "$MEDIA"
+          else
+            aws ecr put-image \
+              --repository-name "${ECR_REPO}" \
+              --image-tag latest \
+              --image-manifest file://manifest.json
+          fi
 
       - name: Trivy scan — final image (registry)
         if: needs.detect-changes.outputs.app_changed != 'true'
