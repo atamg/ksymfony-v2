@@ -32,7 +32,7 @@ COPY --from=build /app /app
 ARG APP_VERSION=unknown
 LABEL org.opencontainers.image.title="ksymfony" \
       org.opencontainers.image.version=$APP_VERSION \
-      org.opencontainers.image.authors="Ata"
+      org.opencontainers.image.authors="Ata M."
 
 RUN addgroup -g 1000 app && adduser -D -G app -u 1000 app
 RUN mkdir -p var && chown -R 1000:1000 var
