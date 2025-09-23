@@ -1,0 +1,309 @@
+name: Prod Deploy (by digest, with rollback)
+
+on:
+  push:
+    tags: [ "v*" ]
+  workflow_dispatch:
+    inputs:
+      version_tag:
+        description: "Existing version tag in ECR to deploy (e.g., v1.2.3)"
+        required: false
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: prod-deploy
+  cancel-in-progress: false
+
+env:
+  AWS_REGION:      ${{ vars.AWS_REGION }}
+  ECR_REPO:        ${{ vars.ECR_REPO        || 'ksymfony-v2' }}
+  PROJECT_TAG:     ${{ vars.PROJECT_TAG     || 'ksymfony-v2' }}
+  ENV_TAG:         prod
+  ARTIFACT_BUCKET: ${{ vars.ARTIFACT_BUCKET }}
+
+jobs:
+  resolve-digest:
+    name: Resolve ECR digest for version tag
+    runs-on: ubuntu-latest
+    outputs:
+      DIGEST:  ${{ steps.out.outputs.DIGEST }}
+      VERSION: ${{ steps.out.outputs.VERSION }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute version
+        id: ver
+        run: |
+          set -euo pipefail
+          V="${{ github.event.inputs.version_tag || '' }}"
+          [ -n "$V" ] || V="${GITHUB_REF_NAME:-}"
+          [ -n "$V" ] || { echo "No version tag found"; exit 1; }
+          echo "VERSION=$V" >> "$GITHUB_OUTPUT"
+
+      - name: Configure AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          aws-region:     ${{ env.AWS_REGION }}
+          role-to-assume: ${{ vars.APP_AWS_ROLE_ARN }}
+          mask-aws-account-id: true
+
+      - name: Resolve digest from ECR
+        id: res
+        run: |
+          set -euo pipefail
+          DIGEST=$(aws ecr describe-images \
+            --repository-name "${ECR_REPO}" \
+            --image-ids imageTag="${{ steps.ver.outputs.VERSION }}" \
+            --query 'imageDetails[0].imageDigest' --output text)
+          [ -n "$DIGEST" ] && [ "$DIGEST" != "None" ] || { echo "Tag not found in ECR"; exit 1; }
+          echo "DIGEST=$DIGEST" >> "$GITHUB_OUTPUT"
+
+      - id: out
+        run: |
+          echo "DIGEST=${{ steps.res.outputs.DIGEST }}"   >> "$GITHUB_OUTPUT"
+          echo "VERSION=${{ steps.ver.outputs.VERSION }}" >> "$GITHUB_OUTPUT"
+
+  deploy-prod:
+    name: Deploy PROD by digest + migrations + checks + rollback
+    runs-on: ubuntu-latest
+    environment: prod
+    needs: resolve-digest
+    env:
+      IMAGE_DIGEST: ${{ needs.resolve-digest.outputs.DIGEST }}
+      VERSION:      ${{ needs.resolve-digest.outputs.VERSION }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          aws-region:     ${{ env.AWS_REGION }}
+          role-to-assume: ${{ vars.APP_AWS_ROLE_ARN }}
+          mask-aws-account-id: true
+
+      - name: Discover prod instance IDs
+        id: ids
+        run: |
+          set -euo pipefail
+          IDS=$(aws ec2 describe-instances \
+            --filters "Name=tag:Project,Values=${{ env.PROJECT_TAG }}" \
+                      "Name=tag:Env,Values=${{ env.ENV_TAG }}" \
+                      "Name=instance-state-name,Values=running" \
+            --query "Reservations[].Instances[].InstanceId" --output text)
+          [ -n "$IDS" ] || { echo "No prod instance"; exit 1; }
+          echo "ids=$IDS" >> "$GITHUB_OUTPUT"
+
+      - name: Preflight — verify files exist
+        run: |
+          set -euo pipefail
+          echo "Top-level files:" && ls -la
+          echo "docker/nginx:" && ls -la docker/nginx || true
+          echo "deploy:" && ls -la deploy || true
+          paths=('public/**' 'docker/nginx/default.conf' 'deploy/docker-compose.ec2.yml')
+          for p in "${paths[@]}"; do
+            if ! compgen -G "$p" >/dev/null; then
+              echo "::error::No files matched '$p' in $GITHUB_WORKSPACE"
+              exit 1
+            fi
+          done
+
+      - name: Stage files for deploy
+        run: |
+          set -euo pipefail
+          rm -rf _deploy && mkdir -p _deploy/docker/nginx _deploy/deploy
+          cp -a public _deploy/public
+          cp docker/nginx/default.conf _deploy/docker/nginx/default.conf
+          cp deploy/docker-compose.ec2.yml _deploy/deploy/docker-compose.ec2.yml
+          find _deploy -maxdepth 3 -type f -printf "%P\n"
+
+      - name: Package deploy bundle & upload to S3
+        id: up
+        run: |
+          set -euo pipefail
+          command -v zip >/dev/null 2>&1 || { sudo apt-get update -y && sudo apt-get install -y zip; }
+          rm -f deploy.zip
+          (cd _deploy && zip -r ../deploy.zip .)
+          S3_KEY="${PROJECT_TAG}/${ENV_TAG}/deploy-${GITHUB_SHA}.zip"
+          aws s3 cp deploy.zip "s3://${ARTIFACT_BUCKET}/${S3_KEY}"
+          echo "s3_key=$S3_KEY" >> "$GITHUB_OUTPUT"
+
+      - name: SSM RunCommand — deploy by digest (migrate + up)
+        id: ssm_deploy
+        env:
+          IMAGE_DIGEST: ${{ env.IMAGE_DIGEST }}
+          VERSION:      ${{ env.VERSION }}
+        run: |
+          set -euo pipefail
+
+          IDS='${{ steps.ids.outputs.ids }}'
+          S3_OBJ='${{ steps.up.outputs.s3_key }}'
+          REGION='${{ env.AWS_REGION }}'
+          REPO='${{ env.ECR_REPO }}'
+
+          SCRIPT=$(cat <<'EOS'
+          set -euo pipefail
+
+          command -v unzip >/dev/null 2>&1 || { sudo yum -y install unzip >/dev/null 2>&1 || sudo dnf -y install unzip >/dev/null 2>&1 || true; }
+
+          cd /opt/app
+
+          aws s3 cp "s3://__ARTIFACT_BUCKET__/__S3_OBJ__" /opt/app/_deploy.zip
+
+          rm -rf _deploy && mkdir -p _deploy
+          unzip -o _deploy.zip -d _deploy
+
+          if [ -d "_deploy" ]; then
+            mkdir -p docker/nginx deploy
+            shopt -s dotglob
+            cp -a _deploy/public ./ || true
+            cp -a _deploy/docker/nginx/default.conf docker/nginx/default.conf || true
+            cp -a _deploy/deploy/docker-compose.ec2.yml deploy/docker-compose.ec2.yml || true
+            shopt -u dotglob
+            rm -rf _deploy _deploy.zip
+          fi
+
+          ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text --region __REGION__)"
+          REG="${ACCOUNT_ID}.dkr.ecr.__REGION__.amazonaws.com"
+          APP="${REG}/__REPO__@__DIGEST__"
+
+          aws ecr get-login-password --region "__REGION__" | docker login --username AWS --password-stdin "$REG"
+
+          echo "Deploying $APP (version __VERSION__)"
+          APP_IMAGE="$APP" docker compose -f deploy/docker-compose.ec2.yml pull
+
+          echo "Running DB migrations"
+          APP_IMAGE="$APP" docker compose -f deploy/docker-compose.ec2.yml run --rm app \
+            php bin/console doctrine:migrations:migrate --no-interaction
+
+          APP_IMAGE="$APP" docker compose -f deploy/docker-compose.ec2.yml up -d
+
+          echo "__DIGEST__" > .current_digest
+          docker image prune -f || true
+          EOS
+          )
+
+          SCRIPT="${SCRIPT//__ARTIFACT_BUCKET__/${ARTIFACT_BUCKET}}"
+          SCRIPT="${SCRIPT//__S3_OBJ__/${S3_OBJ}}"
+          SCRIPT="${SCRIPT//__REGION__/${REGION}}"
+          SCRIPT="${SCRIPT//__REPO__/${REPO}}"
+          SCRIPT="${SCRIPT//__DIGEST__/${IMAGE_DIGEST}}"
+          SCRIPT="${SCRIPT//__VERSION__/${VERSION}}"
+
+          PARAMS=$(jq -nc --arg cmds "$SCRIPT" '{commands: [$cmds]}')
+
+          CMD_ID=$(aws ssm send-command \
+            --document-name "AWS-RunShellScript" \
+            --instance-ids $IDS \
+            --parameters "$PARAMS" \
+            --comment "Prod deploy $REPO @$IMAGE_DIGEST ($VERSION)" \
+            --cloud-watch-output-config "CloudWatchOutputEnabled=true" \
+            --query "Command.CommandId" --output text)
+
+          echo "cmd_id=$CMD_ID" >> "$GITHUB_OUTPUT"
+
+          for ID in $IDS; do
+            while true; do
+              ST=$(aws ssm list-command-invocations --command-id "$CMD_ID" --instance-id "$ID" --details \
+                    --query "CommandInvocations[0].Status" --output text)
+              case "$ST" in
+                Success) echo "Instance $ID: success"; break ;;
+                Failed|TimedOut|Cancelled|Cancelling) echo "::error::Instance $ID: $ST"; exit 1 ;;
+                *) echo "Instance $ID: $ST ..."; sleep 5 ;;
+              esac
+            done
+          done
+
+      - name: Post-deploy checks (SSM curl localhost)
+        id: ssm_check
+        run: |
+          set -euo pipefail
+
+          IDS='${{ steps.ids.outputs.ids }}'
+          PARAMS='{"commands":["curl -fsS --max-time 10 http://localhost/_health >/dev/null"]}'
+
+          CMD_ID=$(aws ssm send-command \
+            --document-name "AWS-RunShellScript" \
+            --instance-ids $IDS \
+            --parameters "$PARAMS" \
+            --comment "prod health check" \
+            --query "Command.CommandId" --output text)
+
+          for ID in $IDS; do
+            while true; do
+              ST=$(aws ssm list-command-invocations --command-id "$CMD_ID" --instance-id "$ID" --details \
+                    --query "CommandInvocations[0].Status" --output text)
+              case "$ST" in
+                Success) echo "Health OK on $ID"; break ;;
+                Failed|TimedOut|Cancelled|Cancelling) echo "::error::Health check failed on $ID ($ST)"; exit 1 ;;
+                *) sleep 3 ;;
+              esac
+            done
+          done
+
+      - name: Rollback on failure (previous semver digest via SSM)
+        if: failure()
+        run: |
+          set -euo pipefail
+
+          IDS='${{ steps.ids.outputs.ids }}'
+          REGION='${{ env.AWS_REGION }}'
+          REPO='${{ env.ECR_REPO }}'
+          CURR='${{ env.IMAGE_DIGEST }}'
+
+          # Find previous semver-tagged image digest (not the current one)
+          JSON=$(aws ecr describe-images --repository-name "${REPO}" --output json)
+          PREV=$(echo "$JSON" | jq -r '
+            .imageDetails
+            | sort_by(.imagePushedAt) | reverse
+            | map(select(.imageTags | tostring | test("^.*v[0-9]+\\.[0-9]+\\.[0-9]+.*$")))
+            | map(.imageDigest)
+            | map(select(. != "'"$CURR"'"))
+            | .[0] // empty
+          ')
+          [ -n "$PREV" ] || { echo "No previous release digest to roll back to"; exit 1; }
+
+          SCRIPT=$(cat <<'EOS'
+          set -euo pipefail
+
+          ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text --region __REGION__)"
+          REG="${ACCOUNT_ID}.dkr.ecr.__REGION__.amazonaws.com"
+          APP="${REG}/__REPO__@__PREV__"
+
+          aws ecr get-login-password --region "__REGION__" | docker login --username AWS --password-stdin "$REG"
+
+          echo "Rolling back to $APP"
+          APP_IMAGE="$APP" docker compose -f /opt/app/deploy/docker-compose.ec2.yml pull
+          APP_IMAGE="$APP" docker compose -f /opt/app/deploy/docker-compose.ec2.yml up -d
+
+          echo "__PREV__" > /opt/app/.current_digest
+          EOS
+          )
+
+          SCRIPT="${SCRIPT//__REGION__/${REGION}}"
+          SCRIPT="${SCRIPT//__REPO__/${REPO}}"
+          SCRIPT="${SCRIPT//__PREV__/${PREV}}"
+
+          PARAMS=$(jq -nc --arg cmds "$SCRIPT" '{commands: [$cmds]}')
+
+          CMD_ID=$(aws ssm send-command \
+            --document-name "AWS-RunShellScript" \
+            --instance-ids $IDS \
+            --parameters "$PARAMS" \
+            --comment "prod rollback to $PREV" \
+            --cloud-watch-output-config "CloudWatchOutputEnabled=true" \
+            --query "Command.CommandId" --output text)
+
+          for ID in $IDS; do
+            while true; do
+              ST=$(aws ssm list-command-invocations --command-id "$CMD_ID" --instance-id "$ID" --details \
+                    --query "CommandInvocations[0].Status" --output text)
+              case "$ST" in
+                Success) echo "Rollback OK on $ID"; break ;;
+                Failed|TimedOut|Cancelled|Cancelling) echo "::error::Rollback failed on $ID ($ST)"; exit 1 ;;
+                *) sleep 3 ;;
+              esac
+            done
+          done

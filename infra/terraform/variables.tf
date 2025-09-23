@@ -2,7 +2,7 @@
 
 variable "project_name" { 
   type = string
-  default = "ksymfony" 
+  default = "ksymfony-v2" 
   }
 variable "aws_region"   { 
   type = string
@@ -37,8 +37,14 @@ variable "open_https_443" {
   default = false 
   }
 
-variable "github_owner" { type = string }
-variable "github_repo"  { type = string }
+variable "github_owner" { 
+  type = string 
+  default = "atamg" 
+  }
+variable "github_repo"  { 
+  type = string 
+  default = "ksymfony-v2" 
+  }
 variable "allowed_refs" {
   type    = list(string)
   default = ["refs/heads/main", "refs/tags/v*"]

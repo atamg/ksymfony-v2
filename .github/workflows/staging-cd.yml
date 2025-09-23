@@ -1,0 +1,360 @@
+name: Staging — Build, Push, Deploy, Smoke
+
+on:
+  workflow_run:
+    workflows: [ "CI (Lint, Test, Scan)" ]
+    types: [ completed ]
+  workflow_dispatch:
+    inputs:
+      from_version:
+        description: "(Optional) Deploy an existing semver tag to staging instead of building"
+        required: false
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: staging-deploy
+  cancel-in-progress: false
+
+env:
+  AWS_REGION:   ${{ vars.AWS_REGION }}
+  ECR_REPO:     ${{ vars.ECR_REPO     || 'ksymfony' }}
+  PROJECT_TAG:  ${{ vars.PROJECT_TAG  || 'ksymfony' }}
+  ENV_TAG:      staging
+  ENABLE_SBOM:  ${{ vars.ENABLE_SBOM  || 'false' }}
+  ARTIFACT_BUCKET: ${{ vars.ARTIFACT_BUCKET }}
+
+jobs:
+  build-and-push:
+    name: Build & Push (record digest)
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (fromJSON(vars.DEPLOY_TO_STAGING || 'false') &&
+       github.event_name == 'workflow_run' &&
+       github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.head_branch == 'main')
+    runs-on: ubuntu-latest
+    outputs:
+      IMAGE_DIGEST: ${{ steps.digest.outputs.DIGEST }}
+      IMAGE_TAG:    ${{ steps.meta.outputs.TAG }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          aws-region:     ${{ env.AWS_REGION }}
+          role-to-assume: ${{ vars.APP_AWS_ROLE_ARN }}
+          mask-aws-account-id: true
+
+      - name: Ensure ECR repo exists (immutable tags)
+        run: |
+          set -euo pipefail
+          aws ecr describe-repositories --repository-names "${ECR_REPO}" >/dev/null 2>&1 \
+            || aws ecr create-repository --repository-name "${ECR_REPO}" \
+                 --image-scanning-configuration scanOnPush=true \
+                 --image-tag-mutability IMMUTABLE
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Decide tag (rc-<sha> or provided from_version)
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -n "${{ github.event.inputs.from_version || '' }}" ]; then
+            echo "TAG=${{ github.event.inputs.from_version }}" >> "$GITHUB_OUTPUT"
+            echo "MODE=promote" >> "$GITHUB_OUTPUT"
+          else
+            echo "TAG=rc-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+            echo "MODE=build" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build & push image (rc tag)
+        if: steps.meta.outputs.MODE == 'build'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64
+          tags: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPO }}:${{ steps.meta.outputs.TAG }}
+          cache-from: type=gha,scope=${{ env.ECR_REPO }}
+          cache-to:   type=gha,mode=max,scope=${{ env.ECR_REPO }}
+
+      - name: Resolve image digest from ECR
+        id: digest
+        run: |
+          set -euo pipefail
+          DIGEST=$(aws ecr describe-images \
+            --repository-name "${ECR_REPO}" \
+            --image-ids imageTag="${{ steps.meta.outputs.TAG }}" \
+            --query 'imageDetails[0].imageDigest' --output text)
+          [ -n "$DIGEST" ] && [ "$DIGEST" != "None" ] || { echo "Image not found"; exit 1; }
+          echo "DIGEST=$DIGEST" >> "$GITHUB_OUTPUT"
+
+      - name: Trivy — image (CRITICAL gate)
+        uses: aquasecurity/trivy-action@0.33.1
+        with:
+          image-ref: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPO }}:${{ steps.meta.outputs.TAG }}
+          vuln-type: 'os,library'
+          ignore-unfixed: true
+          severity: 'CRITICAL'
+          exit-code: '1'
+
+      - name: Generate SBOM (Syft)
+        if: env.ENABLE_SBOM == 'true'
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPO }}:${{ steps.meta.outputs.TAG }}
+          output-file: sbom.spdx.json
+
+      - name: Upload SBOM artifact
+        if: env.ENABLE_SBOM == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-staging
+          path: sbom.spdx.json
+
+  deploy-staging:
+    name: Deploy STAGING by digest + migrations + smoke
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (fromJSON(vars.DEPLOY_TO_STAGING || 'false') &&
+       github.event_name == 'workflow_run' &&
+       github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.head_branch == 'main')
+    runs-on: ubuntu-latest
+    environment: staging
+    needs: build-and-push
+    env:
+      IMAGE_DIGEST: ${{ needs.build-and-push.outputs.IMAGE_DIGEST }}
+    steps:
+      - name: Configure AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          aws-region:     ${{ env.AWS_REGION }}
+          role-to-assume: ${{ vars.APP_AWS_ROLE_ARN }}
+          mask-aws-account-id: true
+
+      - name: Discover staging instance IDs
+        id: ids
+        run: |
+          set -euo pipefail
+          IDS=$(aws ec2 describe-instances \
+            --filters "Name=tag:Project,Values=${{ env.PROJECT_TAG }}" \
+                      "Name=tag:Env,Values=${{ env.ENV_TAG }}" \
+                      "Name=instance-state-name,Values=running" \
+            --query "Reservations[].Instances[].InstanceId" --output text)
+          [ -n "$IDS" ] || { echo "No staging instance"; exit 1; }
+          echo "ids=$IDS" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4    
+
+      - name: Preflight — verify files exist
+        run: |
+          set -euo pipefail
+          echo "Top-level files:" && ls -la
+          echo "docker/nginx:" && ls -la docker/nginx || true
+          echo "deploy:" && ls -la deploy || true
+          paths=('public/**' 'docker/nginx/default.conf' 'deploy/docker-compose.ec2.yml')
+          for p in "${paths[@]}"; do
+            if ! compgen -G "$p" >/dev/null; then
+              echo "::error::No files matched '$p' in $GITHUB_WORKSPACE"
+              exit 1
+            fi
+          done
+
+      - name: Stage files for deploy
+        run: |
+          set -euo pipefail
+          rm -rf _deploy && mkdir -p _deploy/docker/nginx _deploy/deploy
+          cp -a public _deploy/public
+          cp docker/nginx/default.conf _deploy/docker/nginx/default.conf
+          cp deploy/docker-compose.ec2.yml _deploy/deploy/docker-compose.ec2.yml
+          find _deploy -maxdepth 3 -type f -printf "%P\n"
+
+      - name: Package deploy bundle & upload to S3
+        id: up
+        run: |
+          set -euo pipefail
+          command -v zip >/dev/null 2>&1 || { sudo apt-get update -y && sudo apt-get install -y zip; }
+          rm -f deploy.zip
+          (cd _deploy && zip -r ../deploy.zip .)
+          S3_KEY="${PROJECT_TAG}/${ENV_TAG}/deploy-${GITHUB_SHA}.zip"
+          aws s3 cp deploy.zip "s3://${ARTIFACT_BUCKET}/${S3_KEY}"
+          echo "s3_key=$S3_KEY" >> "$GITHUB_OUTPUT"
+
+      - name: SSM RunCommand — deploy by digest (no migrations unless present)
+        id: ssm
+        env:
+          IMAGE_DIGEST: ${{ env.IMAGE_DIGEST }}
+        run: |
+          set -euo pipefail
+        
+          IDS='${{ steps.ids.outputs.ids }}'
+          S3_OBJ='${{ steps.up.outputs.s3_key }}'
+          REGION='${{ env.AWS_REGION }}'
+          REPO='${{ env.ECR_REPO }}'
+          BUCKET='${{ env.ARTIFACT_BUCKET }}'
+          LOG_GROUP="/ssm/${{ env.PROJECT_TAG }}-${{ env.ENV_TAG }}"
+        
+          # Ensure CW Logs group for live output
+          aws logs create-log-group --log-group-name "$LOG_GROUP" 2>/dev/null || true
+          aws logs put-retention-policy --log-group-name "$LOG_GROUP" --retention-in-days 7 || true
+        
+          SCRIPT=$(cat <<'EOS'
+          set -euo pipefail
+          set -x
+        
+          echo "Region=__REGION__  Repo=__REPO__  Digest=__DIGEST__"
+          echo "Bundle: s3://__ARTIFACT_BUCKET__/__S3_OBJ__"
+        
+          command -v unzip >/dev/null 2>&1 || { yum -y install unzip >/dev/null 2>&1 || dnf -y install unzip >/dev/null 2>&1 || true; }
+        
+          cd /opt/app
+        
+          # Download deploy bundle (needs only GetObject)
+          aws s3 cp "s3://__ARTIFACT_BUCKET__/__S3_OBJ__" /opt/app/_deploy.zip \
+            || { echo "Download failed — GetObject denied or object missing"; exit 2; }
+        
+          rm -rf _deploy && mkdir -p _deploy
+          unzip -o _deploy.zip -d _deploy
+        
+          if [ -d "_deploy" ]; then
+            mkdir -p docker/nginx deploy
+            shopt -s dotglob
+            cp -a _deploy/public ./ || true
+            cp -a _deploy/docker/nginx/default.conf docker/nginx/default.conf || true
+            cp -a _deploy/deploy/docker-compose.ec2.yml deploy/docker-compose.ec2.yml || true
+            shopt -u dotglob
+            rm -rf _deploy _deploy.zip
+          fi
+        
+          test -f deploy/docker-compose.ec2.yml || { echo "deploy/docker-compose.ec2.yml missing"; exit 5; }
+        
+          docker version || { echo "Docker not installed"; exit 3; }
+          docker compose version || { echo "Docker Compose plugin missing"; exit 4; }
+        
+          echo "Compose services available:"
+          docker compose -f deploy/docker-compose.ec2.yml config --services || true
+        
+          ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text --region __REGION__)"
+          REG="${ACCOUNT_ID}.dkr.ecr.__REGION__.amazonaws.com"
+          APP="${REG}/__REPO__@__DIGEST__"
+        
+          aws ecr get-login-password --region "__REGION__" | docker login --username AWS --password-stdin "$REG"
+        
+          # Choose a service name: prefer 'app', otherwise first service
+          SERVICE="app"
+          if ! docker compose -f deploy/docker-compose.ec2.yml config --services | grep -qx "$SERVICE"; then
+            SERVICE="$(docker compose -f deploy/docker-compose.ec2.yml config --services | head -n1)"
+            echo "Using detected service: $SERVICE"
+          fi
+        
+          # Pull & start
+          APP_IMAGE="$APP" docker compose -f deploy/docker-compose.ec2.yml pull
+          # If Symfony console exists in the container, warm cache; run migrations only if command exists
+          if APP_IMAGE="$APP" docker compose -f deploy/docker-compose.ec2.yml run --rm "$SERVICE" test -f bin/console; then
+            # Warm cache (ignore failures on non-Symfony images)
+            APP_IMAGE="$APP" docker compose -f deploy/docker-compose.ec2.yml run --rm "$SERVICE" \
+              php bin/console cache:clear --no-warmup || true
+            APP_IMAGE="$APP" docker compose -f deploy/docker-compose.ec2.yml run --rm "$SERVICE" \
+              php bin/console cache:warmup || true
+        
+            # Only run migrations if the command exists
+            if APP_IMAGE="$APP" docker compose -f deploy/docker-compose.ec2.yml run --rm "$SERVICE" \
+                 php bin/console list --raw | grep -qx 'doctrine:migrations:migrate'; then
+              APP_IMAGE="$APP" docker compose -f deploy/docker-compose.ec2.yml run --rm "$SERVICE" \
+                php bin/console doctrine:migrations:migrate --no-interaction
+            else
+              echo "No Doctrine migrations command found; skipping DB migrations."
+            fi
+          else
+            echo "bin/console not found; skipping Symfony cache/migration steps."
+          fi
+        
+          APP_IMAGE="$APP" docker compose -f deploy/docker-compose.ec2.yml up -d
+        
+          docker image prune -f || true
+          EOS
+          )
+        
+          SCRIPT="${SCRIPT//__ARTIFACT_BUCKET__/${BUCKET}}"
+          SCRIPT="${SCRIPT//__S3_OBJ__/${S3_OBJ}}"
+          SCRIPT="${SCRIPT//__REGION__/${REGION}}"
+          SCRIPT="${SCRIPT//__REPO__/${REPO}}"
+          SCRIPT="${SCRIPT//__DIGEST__/${IMAGE_DIGEST}}"
+        
+          PARAMS=$(jq -nc --arg cmds "$SCRIPT" '{commands: [$cmds]}')
+        
+          CMD_ID=$(aws ssm send-command \
+            --document-name "AWS-RunShellScript" \
+            --instance-ids $IDS \
+            --parameters "$PARAMS" \
+            --comment "Staging deploy $REPO @$IMAGE_DIGEST" \
+            --timeout-seconds 1800 \
+            --cloud-watch-output-config "CloudWatchOutputEnabled=true,CloudWatchLogGroupName=${LOG_GROUP}" \
+            --cli-binary-format raw-in-base64-out \
+            --query "Command.CommandId" --output text)
+        
+          echo "cmd_id=$CMD_ID" >> "$GITHUB_OUTPUT"
+        
+            
+      - name: Wait for SSM & print logs on failure
+        run: |
+          set -euo pipefail
+          CMD_ID='${{ steps.ssm.outputs.cmd_id }}'
+          IDS='${{ steps.ids.outputs.ids }}'
+          for ID in $IDS; do
+            while true; do
+              ST=$(aws ssm list-command-invocations --command-id "$CMD_ID" --instance-id "$ID" --details \
+                    --query "CommandInvocations[0].Status" --output text)
+              case "$ST" in
+                Success) echo "Instance $ID: success"; break ;;
+                Failed|TimedOut|Cancelled|Cancelling)
+                  echo "Instance $ID: $ST. Fetching logs…"
+                  aws ssm get-command-invocation \
+                    --command-id "$CMD_ID" --instance-id "$ID" \
+                    --plugin-name aws:RunShellScript \
+                    --query '{Status:Status,Exit:ResponseCode,StdOut:StandardOutputContent,StdErr:StandardErrorContent}' \
+                    --output json
+                  exit 1 ;;
+                *) echo "Instance $ID: $ST ..."; sleep 5 ;;
+              esac
+            done
+          done
+        
+
+      - name: SSM smoke (curl on instance)
+        run: |
+          set -euo pipefail
+
+          IDS=$(aws ec2 describe-instances \
+            --filters "Name=tag:Project,Values=${{ env.PROJECT_TAG }}" \
+                      "Name=tag:Env,Values=${{ env.ENV_TAG }}" \
+                      "Name=instance-state-name,Values=running" \
+            --query "Reservations[].Instances[].InstanceId" --output text)
+          [ -n "$IDS" ] || { echo "No staging instance"; exit 1; }
+
+          PARAMS='{"commands":["curl -fsS --max-time 10 http://localhost/healthz >/dev/null"]}'
+
+          for ID in $IDS; do
+            while true; do
+              ST=$(aws ssm list-command-invocations --command-id "$CMD_ID" --instance-id "$ID" --details \
+                    --query "CommandInvocations[0].Status" --output text)
+              case "$ST" in
+                Success) echo "Smoke OK on $ID"; break ;;
+                Failed|TimedOut|Cancelled|Cancelling) echo "::error::Smoke failed on $ID ($ST)"; exit 1 ;;
+                *) sleep 3 ;;
+              esac
+            done
+          done
