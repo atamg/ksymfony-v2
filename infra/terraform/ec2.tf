@@ -12,7 +12,7 @@ variable "env" {
 
 variable "artifact_bucket_name" {
   type        = string
-  default = "ksymfony-artifacts"
+  default = "ksymfony-v2-artifacts"
   description = "S3 bucket that stores deploy bundles (deploy.zip) for SSM-based deploys"
 }
 

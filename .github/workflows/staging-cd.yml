@@ -137,6 +137,7 @@ jobs:
     needs: build-and-push
     env:
       IMAGE_DIGEST: ${{ needs.build-and-push.outputs.IMAGE_DIGEST }}
+      IMAGE_TAG:    ${{ needs.build-and-push.outputs.IMAGE_TAG }}
     steps:
       - name: Configure AWS (OIDC)
         uses: aws-actions/configure-aws-credentials@v5
@@ -205,6 +206,7 @@ jobs:
           REPO='${{ env.ECR_REPO }}'
           BUCKET='${{ env.ARTIFACT_BUCKET }}'
           LOG_GROUP="/ssm/${{ env.PROJECT_TAG }}-${{ env.ENV_TAG }}"
+          APP_VERSION='${{ env.IMAGE_TAG }}'
         
           aws logs create-log-group --log-group-name "$LOG_GROUP" 2>/dev/null || true
           aws logs put-retention-policy --log-group-name "$LOG_GROUP" --retention-in-days 7 || true
@@ -243,6 +245,8 @@ jobs:
           ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text --region __REGION__)"
           REG="${ACCOUNT_ID}.dkr.ecr.__REGION__.amazonaws.com"
           APP="${REG}/__REPO__@__DIGEST__"
+          export APP_IMAGE="$APP"
+          export APP_VERSION="${APP_VERSION:-unknown}"
           aws ecr get-login-password --region "__REGION__" | docker login --username AWS --password-stdin "$REG"
         
           SERVICE="app"
