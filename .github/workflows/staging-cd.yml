@@ -310,24 +310,33 @@ jobs:
       - name: SSM smoke (curl on instance)
         run: |
           set -euo pipefail
-
-          IDS=$(aws ec2 describe-instances \
-            --filters "Name=tag:Project,Values=${{ env.PROJECT_TAG }}" \
-                      "Name=tag:Env,Values=${{ env.ENV_TAG }}" \
-                      "Name=instance-state-name,Values=running" \
-            --query "Reservations[].Instances[].InstanceId" --output text)
+          IDS='${{ steps.ids.outputs.ids }}'
           [ -n "$IDS" ] || { echo "No staging instance"; exit 1; }
 
-          PARAMS='{"commands":["curl -fsS --max-time 10 http://localhost/healthz >/dev/null"]}'
+          SMOKE_PARAMS='{"commands":["curl -fsS --max-time 10 http://localhost/healthz >/dev/null || exit 2"]}'
+          SMOKE_CMD_ID=$(aws ssm send-command \
+            --document-name "AWS-RunShellScript" \
+            --instance-ids $IDS \
+            --parameters "$SMOKE_PARAMS" \
+            --comment "Staging smoke check" \
+            --timeout-seconds 60 \
+            --query "Command.CommandId" --output text)
 
           for ID in $IDS; do
             while true; do
-              ST=$(aws ssm list-command-invocations --command-id "$CMD_ID" --instance-id "$ID" --details \
-                    --query "CommandInvocations[0].Status" --output text)
+              ST=$(aws ssm list-command-invocations --command-id "$SMOKE_CMD_ID" --instance-id "$ID" --details \
+                   --query "CommandInvocations[0].Status" --output text)
               case "$ST" in
                 Success) echo "Smoke OK on $ID"; break ;;
-                Failed|TimedOut|Cancelled|Cancelling) echo "::error::Smoke failed on $ID ($ST)"; exit 1 ;;
-                *) sleep 3 ;;
+                Failed|TimedOut|Cancelled|Cancelling)
+                  echo "::error::Smoke failed on $ID ($ST). Fetching logs..."
+                  aws ssm get-command-invocation \
+                    --command-id "$SMOKE_CMD_ID" --instance-id "$ID" \
+                    --plugin-name aws:RunShellScript \
+                    --query '{Status:Status,Exit:ResponseCode,StdOut:StandardOutputContent,StdErr:StandardErrorContent}' \
+                    --output json
+                  exit 1 ;;
+                *) sleep 2 ;;
               esac
             done
           done
