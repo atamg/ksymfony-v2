@@ -193,13 +193,12 @@ jobs:
           aws s3 cp deploy.zip "s3://${ARTIFACT_BUCKET}/${S3_KEY}"
           echo "s3_key=$S3_KEY" >> "$GITHUB_OUTPUT"
 
-      - name: SSM RunCommand — deploy by digest (no migrations unless present)
+      - name: SSM RunCommand — deploy by digest (no-ls)
         id: ssm
         env:
           IMAGE_DIGEST: ${{ env.IMAGE_DIGEST }}
         run: |
           set -euo pipefail
-        
           IDS='${{ steps.ids.outputs.ids }}'
           S3_OBJ='${{ steps.up.outputs.s3_key }}'
           REGION='${{ env.AWS_REGION }}'
@@ -207,28 +206,24 @@ jobs:
           BUCKET='${{ env.ARTIFACT_BUCKET }}'
           LOG_GROUP="/ssm/${{ env.PROJECT_TAG }}-${{ env.ENV_TAG }}"
         
-          # Ensure CW Logs group for live output
           aws logs create-log-group --log-group-name "$LOG_GROUP" 2>/dev/null || true
           aws logs put-retention-policy --log-group-name "$LOG_GROUP" --retention-in-days 7 || true
         
           SCRIPT=$(cat <<'EOS'
           set -euo pipefail
           set -x
-        
           echo "Region=__REGION__  Repo=__REPO__  Digest=__DIGEST__"
           echo "Bundle: s3://__ARTIFACT_BUCKET__/__S3_OBJ__"
         
           command -v unzip >/dev/null 2>&1 || { yum -y install unzip >/dev/null 2>&1 || dnf -y install unzip >/dev/null 2>&1 || true; }
-        
           cd /opt/app
         
-          # Download deploy bundle (needs only GetObject)
+          # Needs only GetObject; will fail cleanly if bucket policy/endpoint still deny
           aws s3 cp "s3://__ARTIFACT_BUCKET__/__S3_OBJ__" /opt/app/_deploy.zip \
             || { echo "Download failed — GetObject denied or object missing"; exit 2; }
         
           rm -rf _deploy && mkdir -p _deploy
           unzip -o _deploy.zip -d _deploy
-        
           if [ -d "_deploy" ]; then
             mkdir -p docker/nginx deploy
             shopt -s dotglob
@@ -240,50 +235,24 @@ jobs:
           fi
         
           test -f deploy/docker-compose.ec2.yml || { echo "deploy/docker-compose.ec2.yml missing"; exit 5; }
-        
           docker version || { echo "Docker not installed"; exit 3; }
           docker compose version || { echo "Docker Compose plugin missing"; exit 4; }
         
-          echo "Compose services available:"
-          docker compose -f deploy/docker-compose.ec2.yml config --services || true
+          echo "Compose services available:"; docker compose -f deploy/docker-compose.ec2.yml config --services || true
         
           ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text --region __REGION__)"
           REG="${ACCOUNT_ID}.dkr.ecr.__REGION__.amazonaws.com"
           APP="${REG}/__REPO__@__DIGEST__"
-        
           aws ecr get-login-password --region "__REGION__" | docker login --username AWS --password-stdin "$REG"
         
-          # Choose a service name: prefer 'app', otherwise first service
           SERVICE="app"
           if ! docker compose -f deploy/docker-compose.ec2.yml config --services | grep -qx "$SERVICE"; then
             SERVICE="$(docker compose -f deploy/docker-compose.ec2.yml config --services | head -n1)"
             echo "Using detected service: $SERVICE"
           fi
         
-          # Pull & start
           APP_IMAGE="$APP" docker compose -f deploy/docker-compose.ec2.yml pull
-          # If Symfony console exists in the container, warm cache; run migrations only if command exists
-          if APP_IMAGE="$APP" docker compose -f deploy/docker-compose.ec2.yml run --rm "$SERVICE" test -f bin/console; then
-            # Warm cache (ignore failures on non-Symfony images)
-            APP_IMAGE="$APP" docker compose -f deploy/docker-compose.ec2.yml run --rm "$SERVICE" \
-              php bin/console cache:clear --no-warmup || true
-            APP_IMAGE="$APP" docker compose -f deploy/docker-compose.ec2.yml run --rm "$SERVICE" \
-              php bin/console cache:warmup || true
-        
-            # Only run migrations if the command exists
-            if APP_IMAGE="$APP" docker compose -f deploy/docker-compose.ec2.yml run --rm "$SERVICE" \
-                 php bin/console list --raw | grep -qx 'doctrine:migrations:migrate'; then
-              APP_IMAGE="$APP" docker compose -f deploy/docker-compose.ec2.yml run --rm "$SERVICE" \
-                php bin/console doctrine:migrations:migrate --no-interaction
-            else
-              echo "No Doctrine migrations command found; skipping DB migrations."
-            fi
-          else
-            echo "bin/console not found; skipping Symfony cache/migration steps."
-          fi
-        
           APP_IMAGE="$APP" docker compose -f deploy/docker-compose.ec2.yml up -d
-        
           docker image prune -f || true
           EOS
           )
