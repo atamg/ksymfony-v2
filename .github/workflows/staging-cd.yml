@@ -192,6 +192,8 @@ jobs:
           (cd _deploy && zip -r ../deploy.zip .)
           S3_KEY="${PROJECT_TAG}/${ENV_TAG}/deploy-${GITHUB_SHA}.zip"
           aws s3 cp deploy.zip "s3://${ARTIFACT_BUCKET}/${S3_KEY}"
+          # lightweight CI log: non-sensitive info to trace the uploaded bundle
+          echo "Uploaded deploy bundle to s3://${ARTIFACT_BUCKET}/${S3_KEY}"
           echo "s3_key=$S3_KEY" >> "$GITHUB_OUTPUT"
 
       - name: SSM RunCommand — deploy by digest (no-ls)
@@ -206,16 +208,24 @@ jobs:
           REPO='${{ env.ECR_REPO }}'
           BUCKET='${{ env.ARTIFACT_BUCKET }}'
           LOG_GROUP="/ssm/${{ env.PROJECT_TAG }}-${{ env.ENV_TAG }}"
+          CONTAINER_LOG_GROUP="/containers/${{ env.PROJECT_TAG }}-${{ env.ENV_TAG }}"
           APP_VERSION='${{ env.IMAGE_TAG }}'
         
+          # Ensure CloudWatch log groups exist (runner will create; instance may also create)
           aws logs create-log-group --log-group-name "$LOG_GROUP" 2>/dev/null || true
           aws logs put-retention-policy --log-group-name "$LOG_GROUP" --retention-in-days 7 || true
+          aws logs create-log-group --log-group-name "$CONTAINER_LOG_GROUP" 2>/dev/null || true
+          aws logs put-retention-policy --log-group-name "$CONTAINER_LOG_GROUP" --retention-in-days 14 || true
         
           SCRIPT=$(cat <<'EOS'
           set -euo pipefail
           set -x
           echo "Region=__REGION__  Repo=__REPO__  Digest=__DIGEST__"
           echo "Bundle: s3://__ARTIFACT_BUCKET__/__S3_OBJ__"
+          # ensure AWS_REGION is exported so docker-compose interpolation (awslogs region) works
+          export AWS_REGION="__REGION__"
+          # container logs group name (substituted by runner)
+          CONTAINER_LOG_GROUP="__CONTAINER_LOG_GROUP__"
         
           command -v unzip >/dev/null 2>&1 || { yum -y install unzip >/dev/null 2>&1 || dnf -y install unzip >/dev/null 2>&1 || true; }
           cd /opt/app
@@ -239,9 +249,7 @@ jobs:
           test -f deploy/docker-compose.ec2.yml || { echo "deploy/docker-compose.ec2.yml missing"; exit 5; }
           docker version || { echo "Docker not installed"; exit 3; }
           docker compose version || { echo "Docker Compose plugin missing"; exit 4; }
-        
-          echo "Compose services available:"; docker compose -f deploy/docker-compose.ec2.yml config --services || true
-        
+               
           ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text --region __REGION__)"
           REG="${ACCOUNT_ID}.dkr.ecr.__REGION__.amazonaws.com"
           APP="${REG}/__REPO__@__DIGEST__"
@@ -260,12 +268,14 @@ jobs:
           docker image prune -f || true
           EOS
           )
-        
+
+          # Substitute placeholders in the script before sending to SSM
           SCRIPT="${SCRIPT//__ARTIFACT_BUCKET__/${BUCKET}}"
           SCRIPT="${SCRIPT//__S3_OBJ__/${S3_OBJ}}"
           SCRIPT="${SCRIPT//__REGION__/${REGION}}"
           SCRIPT="${SCRIPT//__REPO__/${REPO}}"
           SCRIPT="${SCRIPT//__DIGEST__/${IMAGE_DIGEST}}"
+          SCRIPT="${SCRIPT//__CONTAINER_LOG_GROUP__/${CONTAINER_LOG_GROUP}}"
         
           PARAMS=$(jq -nc --arg cmds "$SCRIPT" '{commands: [$cmds]}')
         
@@ -280,6 +290,7 @@ jobs:
             --query "Command.CommandId" --output text)
         
           echo "cmd_id=$CMD_ID" >> "$GITHUB_OUTPUT"
+          echo "Deployed SSM command id (short): ${CMD_ID:0:8}"
         
             
       - name: Wait for SSM & print logs on failure
@@ -312,6 +323,10 @@ jobs:
           set -euo pipefail
           IDS='${{ steps.ids.outputs.ids }}'
           [ -n "$IDS" ] || { echo "No staging instance"; exit 1; }
+          # ensure same SSM log group exists for smoke checks and retain outputs
+          LOG_GROUP="/ssm/${{ env.PROJECT_TAG }}-${{ env.ENV_TAG }}"
+          aws logs create-log-group --log-group-name "$LOG_GROUP" 2>/dev/null || true
+          aws logs put-retention-policy --log-group-name "$LOG_GROUP" --retention-in-days 7 || true
 
           SMOKE_PARAMS='{"commands":["curl -fsS --max-time 10 http://localhost/healthz >/dev/null || exit 2"]}'
           SMOKE_CMD_ID=$(aws ssm send-command \
@@ -320,6 +335,7 @@ jobs:
             --parameters "$SMOKE_PARAMS" \
             --comment "Staging smoke check" \
             --timeout-seconds 60 \
+            --cloud-watch-output-config "CloudWatchOutputEnabled=true,CloudWatchLogGroupName=${LOG_GROUP}" \
             --query "Command.CommandId" --output text)
 
           for ID in $IDS; do

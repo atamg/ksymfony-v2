@@ -103,6 +103,39 @@ resource "aws_iam_role_policy_attachment" "ec2_cw_agent" {
   policy_arn = "arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy"
 }
 
+# Allow the EC2 role to create/put events into the SSM and container CloudWatch log groups
+resource "aws_iam_policy" "ec2_cw_logs" {
+  name = "${var.project_name}-${var.env}-ec2-cloudwatch-logs"
+  policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [
+      {
+        Sid = "AllowCWLogsWriteForSSMAndContainers"
+        Effect = "Allow"
+        Action = [
+          "logs:CreateLogGroup",
+          "logs:CreateLogStream",
+          "logs:DescribeLogStreams",
+          "logs:PutLogEvents"
+        ]
+        Resource = [
+          "arn:aws:logs:*:*:log-group:/ssm/${var.project_name}-${var.env}*",
+          "arn:aws:logs:*:*:log-group:/ssm/${var.project_name}-${var.env}*:log-stream:*",
+          "arn:aws:logs:*:*:log-group:/containers/${var.project_name}-${var.env}*",
+          "arn:aws:logs:*:*:log-group:/containers/${var.project_name}-${var.env}*:log-stream:*",
+          "arn:aws:logs:*:*:log-group:${aws_cloudwatch_log_group.docker.name}",
+          "arn:aws:logs:*:*:log-group:${aws_cloudwatch_log_group.docker.name}:log-stream:*"
+        ]
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "ec2_cw_logs_attach" {
+  role       = aws_iam_role.ec2_role.name
+  policy_arn = aws_iam_policy.ec2_cw_logs.arn
+}
+
 
 resource "aws_instance" "app" {
   ami                    = data.aws_ssm_parameter.al2023_ami.value
